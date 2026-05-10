@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""
+wiisfi — summarize the Wi-Fi capabilities of the local adapter and the
+characteristics of the currently active link, parsing `iw phy` and
+`iw dev <iface> link / station dump`.
+
+Inspired by https://www.wiisfi.com/ — explains what the values *mean*.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+class C:
+    enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    @classmethod
+    def w(cls, s, code):
+        return f"\033[{code}m{s}\033[0m" if cls.enabled else str(s)
+    bold    = classmethod(lambda c, s: c.w(s, "1"))
+    dim     = classmethod(lambda c, s: c.w(s, "2"))
+    red     = classmethod(lambda c, s: c.w(s, "31"))
+    green   = classmethod(lambda c, s: c.w(s, "32"))
+    yellow  = classmethod(lambda c, s: c.w(s, "33"))
+    blue    = classmethod(lambda c, s: c.w(s, "34"))
+    magenta = classmethod(lambda c, s: c.w(s, "35"))
+    cyan    = classmethod(lambda c, s: c.w(s, "36"))
+
+
+def header(title: str):
+    print()
+    print(C.bold(C.cyan("═══ " + title + " ")) + C.cyan("═" * max(0, 60 - len(title))))
+
+
+def kv(key: str, val: str, comment: str = ""):
+    line = f"  {C.bold(key.ljust(20))} {val}"
+    if comment:
+        line += "  " + C.dim("— " + comment)
+    print(line)
+
+
+def bullet(symbol: str, text: str, expl: str = ""):
+    head = f"  {symbol} {C.bold(text)}"
+    if expl:
+        head += "  " + C.dim("— " + expl)
+    print(head)
+
+
+# ---------------------------------------------------------------------------
+# Feature dictionary (built from wiisfi.com)
+# ---------------------------------------------------------------------------
+
+FEATURES = {
+    # advanced WiFi-6/6E features
+    "OFDMA":          "Lets the AP slice a channel into sub-carriers and serve several "
+                      "clients in parallel — cuts contention in dense environments.",
+    "MU-MIMO":        "Multi-User MIMO: simultaneous spatial streams to several clients "
+                      "instead of one-at-a-time.",
+    "TWT":            "Target Wake Time — clients schedule precise wake intervals with "
+                      "the AP, drastically reducing idle radio time (battery saver).",
+    "BSS Color":      "Tags frames with a 6-bit colour so clients can ignore overlapping "
+                      "neighbour BSSs sharing the channel.",
+    "1024-QAM":       "10 bits/symbol modulation (WiFi 6); ~25 % faster than 256-QAM but "
+                      "needs a strong, clean signal.",
+    "4096-QAM":       "12 bits/symbol modulation (WiFi 7); +20 % over 1024-QAM with "
+                      "near-line-of-sight conditions.",
+    "MLO":            "Multi-Link Operation (WiFi 7): one association uses 2.4 / 5 / 6 GHz "
+                      "links concurrently for higher throughput and seamless failover.",
+    "320 MHz":        "WiFi 7 channel width — doubles 160 MHz, 6 GHz only.",
+    "160 MHz":        "Wide 5/6 GHz channel; doubles 80 MHz throughput when spectrum is "
+                      "free and the client is close to the AP.",
+    "80 MHz":         "Standard WiFi 5/6 channel width on 5 GHz.",
+    "40 MHz":         "Bonded 2×20 MHz; common on 2.4/5 GHz, often unusable on 2.4 GHz "
+                      "due to neighbour overlap.",
+    "20 MHz":         "Baseline channel width; most compatible, lowest throughput.",
+    "Beamforming":    "AP focuses RF energy toward the client antennas instead of "
+                      "broadcasting omni-directionally — better range and rate.",
+    "MU Beamformee":  "Client can be the receiving end of a multi-user beamformed "
+                      "transmission.",
+    "SU Beamformee":  "Client can receive single-user beamformed frames.",
+    "LDPC":           "Low-Density Parity-Check coding — stronger forward error "
+                      "correction than the legacy BCC code; better range / rate.",
+    "STBC":           "Space-Time Block Coding — antenna diversity that improves "
+                      "reliability when streams are not maxed out.",
+    "Short GI":       "Short Guard Interval (400 ns instead of 800 ns) — ~10 % faster "
+                      "PHY rate when multipath delay spread is low.",
+    "11k":            "802.11k Neighbor Reports — AP shares the list of nearby APs so "
+                      "the client makes smarter roaming decisions.",
+    "11v":            "802.11v BSS Transition Management — the AP can suggest a better "
+                      "AP for the client to roam to.",
+    "11r":            "802.11r Fast Transition — pre-authenticates with neighbour APs so "
+                      "roaming completes in <50 ms (good for VoIP).",
+    "MFP":            "Management Frame Protection (802.11w) — encrypts deauth/disassoc "
+                      "to prevent trivial denial-of-service.",
+    "WPA3":           "SAE-based authentication; resistant to offline dictionary attacks "
+                      "(replaces WPA2-PSK).",
+    "DFS":            "Dynamic Frequency Selection — required to share 5 GHz channels "
+                      "with weather/military radar.",
+    "6 GHz":          "New 1200 MHz of spectrum (WiFi 6E+); no legacy clutter, lots of "
+                      "wide channels.",
+}
+
+
+# ---------------------------------------------------------------------------
+# Running iw
+# ---------------------------------------------------------------------------
+
+def run(cmd: List[str]) -> str:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as e:
+        sys.exit(f"error: {e}")
+    if out.returncode != 0 and not out.stdout:
+        sys.exit(f"error running {' '.join(cmd)}:\n{out.stderr.strip()}")
+    return out.stdout
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BandCaps:
+    band_id: int
+    freqs_mhz: List[Tuple[float, bool]] = field(default_factory=list)  # (mhz, enabled)
+    has_ht: bool = False
+    has_vht: bool = False
+    has_he: bool = False
+    has_eht: bool = False
+    widths: List[int] = field(default_factory=list)   # 20/40/80/160/320
+    max_nss: int = 0
+    max_he_mcs: int = -1
+    max_vht_mcs: int = -1
+    max_ht_mcs: int = -1
+    su_beamformee: bool = False
+    mu_beamformee: bool = False
+    mu_mimo_ul: bool = False
+    twt: bool = False
+    bss_color: bool = False
+    ldpc: bool = False
+    stbc_rx: bool = False
+    stbc_tx: bool = False
+    short_gi_20: bool = False
+    short_gi_40: bool = False
+    qam_1024_tx: bool = False
+    qam_4096_tx: bool = False
+
+    @property
+    def label(self) -> str:
+        if not self.freqs_mhz:
+            return f"Band {self.band_id}"
+        f = self.freqs_mhz[0][0]
+        if 2400 <= f <= 2500:
+            return "2.4 GHz"
+        if 5000 <= f <= 5900:
+            return "5 GHz"
+        if 5900 <= f <= 7200:
+            return "6 GHz"
+        return f"Band {self.band_id} ({f:.0f} MHz)"
+
+    @property
+    def enabled_channels(self) -> int:
+        return sum(1 for _, en in self.freqs_mhz if en)
+
+
+@dataclass
+class PhyCaps:
+    name: str = ""
+    bands: Dict[int, BandCaps] = field(default_factory=dict)
+    tx_antennas: int = 0
+    rx_antennas: int = 0
+    rrm: bool = False                  # 802.11k
+    bss_transition: bool = False       # 802.11v (commonly inferred)
+    fast_transition: bool = False      # 802.11r — not in iw phy directly, leave optional
+    protected_twt: bool = False
+    sae: bool = False                  # WPA3
+    mfp_capable: bool = False          # always true on modern adapters; check ciphers
+    ciphers: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LinkInfo:
+    iface: str = ""
+    connected: bool = False
+    ssid: str = ""
+    bssid: str = ""
+    freq_mhz: float = 0.0
+    width_mhz: int = 0
+    signal_dbm: Optional[int] = None
+    tx_bitrate: float = 0.0
+    rx_bitrate: float = 0.0
+    tx_phy: str = ""           # "HE" / "VHT" / "HT" / "EHT" / "legacy"
+    rx_phy: str = ""
+    tx_mcs: Optional[int] = None
+    rx_mcs: Optional[int] = None
+    tx_nss: Optional[int] = None
+    rx_nss: Optional[int] = None
+    tx_width: Optional[int] = None
+    rx_width: Optional[int] = None
+    tx_gi: Optional[int] = None
+    rx_gi: Optional[int] = None
+    tx_retries: Optional[int] = None
+    tx_failed: Optional[int] = None
+    connected_secs: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+
+def detect_chipset(iface: str) -> Dict[str, str]:
+    """Return {driver, bus, slot, vendor_device, marketing}."""
+    out: Dict[str, str] = {}
+    uevent = f"/sys/class/net/{iface}/device/uevent"
+    try:
+        with open(uevent) as f:
+            kv_data = dict(line.strip().split("=", 1)
+                           for line in f if "=" in line)
+    except OSError:
+        return out
+    out["driver"] = kv_data.get("DRIVER", "")
+
+    if "PCI_SLOT_NAME" in kv_data:
+        slot = kv_data["PCI_SLOT_NAME"]
+        out["bus"], out["slot"] = "PCI", slot
+        if shutil.which("lspci"):
+            try:
+                txt = subprocess.run(
+                    ["lspci", "-k", "-nn", "-s", slot],
+                    capture_output=True, text=True, check=False).stdout
+                # Line 1: "0000:00:14.3 Network ... : Intel Corp. Meteor Lake PCH CNVi WiFi [8086:7e40]"
+                # Subsystem line: "    Subsystem: Intel Corporation Wi-Fi 6E AX211 160MHz [8086:0094]"
+                for line in txt.splitlines():
+                    s = line.strip()
+                    if "Network controller" in s or "Wireless" in s:
+                        # "...[0280]: Intel Corporation X [8086:7e40] (rev 20)"
+                        m = re.search(r"\][^:]*:\s*(.+?)(?:\s*\[[0-9a-f]{4}:[0-9a-f]{4}\])(?:\s*\(rev[^)]*\))?\s*$", s)
+                        if m:
+                            out["vendor_device"] = m.group(1)
+                    if s.startswith("Subsystem:"):
+                        m = re.search(r"Subsystem:\s*(.+?)(?:\s*\[[0-9a-f]{4}:[0-9a-f]{4}\])?\s*$", s)
+                        if m:
+                            out["marketing"] = m.group(1)
+            except OSError:
+                pass
+        if "vendor_device" not in out:
+            ids = kv_data.get("PCI_ID", "")
+            if ids: out["vendor_device"] = f"PCI {ids}"
+    elif "PRODUCT" in kv_data:
+        # USB: PRODUCT=vid/pid/rev
+        out["bus"] = "USB"
+        prod = kv_data["PRODUCT"].split("/")
+        if len(prod) >= 2:
+            vid, pid = prod[0].zfill(4), prod[1].zfill(4)
+            out["slot"] = f"{vid}:{pid}"
+            if shutil.which("lsusb"):
+                try:
+                    txt = subprocess.run(
+                        ["lsusb", "-d", f"{vid}:{pid}"],
+                        capture_output=True, text=True, check=False).stdout.strip()
+                    # "Bus 001 Device 003: ID 0bda:b812 Realtek RTL88x2bu ..."
+                    m = re.search(r"ID [0-9a-f]{4}:[0-9a-f]{4}\s+(.+)$", txt)
+                    if m: out["vendor_device"] = m.group(1)
+                except OSError:
+                    pass
+    return out
+
+
+def discover_interface(preferred: Optional[str]) -> Tuple[str, str]:
+    """Return (iface, phy)."""
+    out = run(["iw", "dev"])
+    phy = ""
+    iface = ""
+    matches = []
+    for line in out.splitlines():
+        m = re.match(r"phy#(\d+)", line)
+        if m:
+            phy = f"phy{m.group(1)}"
+            continue
+        m = re.match(r"\s+Interface (\S+)", line)
+        if m:
+            matches.append((m.group(1), phy))
+    if not matches:
+        sys.exit("no Wi-Fi interface found (is iw installed and a device present?)")
+    if preferred:
+        for iface, phy in matches:
+            if iface == preferred:
+                return iface, phy
+        sys.exit(f"interface {preferred!r} not found. Available: "
+                 f"{', '.join(m[0] for m in matches)}")
+    # prefer "managed" — fallback to the first
+    for iface, phy in matches:
+        info = run(["iw", "dev", iface, "info"])
+        if "type managed" in info:
+            return iface, phy
+    return matches[0]
+
+
+def parse_phy(text: str) -> PhyCaps:
+    phy = PhyCaps()
+    cur_band: Optional[BandCaps] = None
+    in_freqs = False
+    iftype_section = ""        # "managed" / "AP" — we only use "managed"
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        m = re.match(r"Wiphy (\S+)", stripped)
+        if m:
+            phy.name = m.group(1)
+            continue
+
+        m = re.match(r"Available Antennas: TX (\S+) RX (\S+)", stripped)
+        if m:
+            phy.tx_antennas = bin(int(m.group(1), 16)).count("1")
+            phy.rx_antennas = bin(int(m.group(2), 16)).count("1")
+            continue
+
+        m = re.match(r"Band (\d+):", stripped)
+        if m:
+            cur_band = BandCaps(band_id=int(m.group(1)))
+            phy.bands[cur_band.band_id] = cur_band
+            in_freqs = False
+            iftype_section = ""
+            continue
+
+        if cur_band is None:
+            # Phy-global features after bands
+            if "RRM" in stripped and "[ RRM ]" in stripped:
+                phy.rrm = True
+            if "PROTECTED_TWT" in stripped:
+                phy.protected_twt = True
+            if "SAE" in stripped:
+                phy.sae = True
+            if stripped.startswith("* ") and "00-0f-ac" in stripped:
+                phy.ciphers.append(stripped.split()[1])
+            continue
+
+        # ---- inside a band ----
+        if stripped.startswith("HE Iftypes:"):
+            iftype_section = stripped
+            in_freqs = False
+            continue
+        if stripped.startswith("EHT Iftypes:"):
+            iftype_section = stripped
+            cur_band.has_eht = True
+            in_freqs = False
+            continue
+        if stripped.startswith("Frequencies:"):
+            in_freqs = True
+            iftype_section = ""
+            continue
+        if stripped.startswith("Bitrates"):
+            in_freqs = False
+            continue
+
+        if in_freqs:
+            m = re.match(r"\* ([\d.]+) MHz \[\d+\](?:.*)$", stripped)
+            if m:
+                mhz = float(m.group(1))
+                enabled = "(disabled)" not in stripped
+                cur_band.freqs_mhz.append((mhz, enabled))
+            continue
+
+        # Capabilities lines — only consume from "managed" iftype to avoid AP variants
+        # (most caps appear at the top of the band, before the iftype split — keep both)
+        is_managed_or_top = (iftype_section == "" or "managed" in iftype_section)
+
+        if "HT20/HT40" in stripped or "HT MCS rate" in stripped or "Max RX data rate" in stripped:
+            cur_band.has_ht = True
+            if "HT20/HT40" in stripped:
+                if 20 not in cur_band.widths: cur_band.widths.append(20)
+                if 40 not in cur_band.widths: cur_band.widths.append(40)
+        if stripped.startswith("VHT Capabilities"):
+            cur_band.has_vht = True
+            if 80 not in cur_band.widths: cur_band.widths.append(80)
+        if "Supported Channel Width: 160 MHz" in stripped:
+            if 160 not in cur_band.widths: cur_band.widths.append(160)
+        if stripped.startswith("HE PHY Capabilities") and is_managed_or_top:
+            cur_band.has_he = True
+        if "HE40/HE80/5GHz" in stripped:
+            for w in (40, 80):
+                if w not in cur_band.widths: cur_band.widths.append(w)
+        if "HE160/5GHz" in stripped or "HE160" in stripped:
+            if 160 not in cur_band.widths: cur_band.widths.append(160)
+        if "EHT320" in stripped or "320 MHz" in stripped:
+            if 320 not in cur_band.widths: cur_band.widths.append(320)
+            cur_band.has_eht = True
+        if "RX LDPC" in stripped or "LDPC Coding in Payload" in stripped:
+            cur_band.ldpc = True
+        if "RX STBC" in stripped:
+            cur_band.stbc_rx = True
+        if stripped == "TX STBC" or "STBC Tx" in stripped:
+            cur_band.stbc_tx = True
+        if "RX HT20 SGI" in stripped or "short GI (20" in stripped.lower():
+            cur_band.short_gi_20 = True
+        if "RX HT40 SGI" in stripped or "short GI (40" in stripped.lower():
+            cur_band.short_gi_40 = True
+        if "SU Beamformee" in stripped:
+            cur_band.su_beamformee = True
+        if "MU Beamformee" in stripped:
+            cur_band.mu_beamformee = True
+        if "Full Bandwidth UL MU-MIMO" in stripped or "UL MU-MIMO" in stripped:
+            cur_band.mu_mimo_ul = True
+        if "Broadcast TWT" in stripped or "TWT Responder" in stripped or "TWT Requester" in stripped:
+            cur_band.twt = True
+        if "BSS Color" in stripped or "BSS Coloring" in stripped:
+            cur_band.bss_color = True
+        if "TX 1024-QAM" in stripped:
+            cur_band.qam_1024_tx = True
+        if "TX 4096-QAM" in stripped:
+            cur_band.qam_4096_tx = True
+
+        # MCS / NSS counting (only "<= 80" or "160 MHz" sets in managed iftype)
+        m = re.match(r"(\d+) streams: MCS 0-(\d+)", stripped)
+        if m and is_managed_or_top:
+            nss = int(m.group(1))
+            mcs = int(m.group(2))
+            if nss > cur_band.max_nss:
+                cur_band.max_nss = nss
+            # heuristics: HE has MCS 0-11, VHT 0-9, HT 0-7
+            if mcs >= 10:
+                cur_band.max_he_mcs = max(cur_band.max_he_mcs, mcs)
+            elif mcs == 9:
+                cur_band.max_vht_mcs = max(cur_band.max_vht_mcs, mcs)
+            else:
+                cur_band.max_ht_mcs = max(cur_band.max_ht_mcs, mcs)
+
+        # HT MCS rate line: "HT TX/RX MCS rate indexes supported: 0-15" → up to 2 streams
+        m = re.match(r"HT TX/RX MCS rate indexes supported: 0-(\d+)", stripped)
+        if m:
+            top = int(m.group(1))
+            # 0-7 → 1 stream, 0-15 → 2, 0-23 → 3, 0-31 → 4
+            ht_nss = (top // 8) + 1
+            if ht_nss > cur_band.max_nss:
+                cur_band.max_nss = ht_nss
+
+    return phy
+
+
+def parse_link(text: str) -> LinkInfo:
+    link = LinkInfo()
+    if "Not connected" in text or text.strip() == "":
+        link.connected = False
+        return link
+    link.connected = True
+
+    for raw in text.splitlines():
+        s = raw.strip()
+        m = re.match(r"Connected to ([0-9a-f:]+)", s)
+        if m: link.bssid = m.group(1); continue
+        m = re.match(r"SSID: (.*)$", s)
+        if m: link.ssid = m.group(1); continue
+        m = re.match(r"freq: ([\d.]+)", s)
+        if m: link.freq_mhz = float(m.group(1)); continue
+        m = re.match(r"signal: (-?\d+) dBm", s)
+        if m: link.signal_dbm = int(m.group(1)); continue
+
+        for direction in ("rx", "tx"):
+            m = re.match(rf"{direction} bitrate: ([\d.]+) MBit/s(.*)$", s)
+            if m:
+                rate = float(m.group(1))
+                rest = m.group(2)
+                phy_kind = "legacy"
+                if "EHT" in rest: phy_kind = "EHT"
+                elif "HE" in rest: phy_kind = "HE"
+                elif "VHT" in rest: phy_kind = "VHT"
+                elif "MCS" in rest: phy_kind = "HT"
+                mcs = nss = width = gi = None
+                mw = re.search(r"(\d+)MHz", rest)
+                if mw: width = int(mw.group(1))
+                mm = re.search(r"(?:HE|VHT|EHT)?-MCS (\d+)", rest)
+                if mm: mcs = int(mm.group(1))
+                else:
+                    mm = re.search(r"\bMCS (\d+)", rest)
+                    if mm: mcs = int(mm.group(1))
+                mn = re.search(r"(?:HE|VHT|EHT)-NSS (\d+)", rest)
+                if mn: nss = int(mn.group(1))
+                mg = re.search(r"(?:HE|VHT|EHT)-GI (\d+)", rest)
+                if mg: gi = int(mg.group(1))
+                if direction == "rx":
+                    link.rx_bitrate, link.rx_phy = rate, phy_kind
+                    link.rx_mcs, link.rx_nss, link.rx_width, link.rx_gi = mcs, nss, width, gi
+                else:
+                    link.tx_bitrate, link.tx_phy = rate, phy_kind
+                    link.tx_mcs, link.tx_nss, link.tx_width, link.tx_gi = mcs, nss, width, gi
+                continue
+    return link
+
+
+def parse_station(text: str, link: LinkInfo) -> LinkInfo:
+    for raw in text.splitlines():
+        s = raw.strip()
+        m = re.match(r"tx retries:\s*(\d+)", s)
+        if m: link.tx_retries = int(m.group(1)); continue
+        m = re.match(r"tx failed:\s*(\d+)", s)
+        if m: link.tx_failed = int(m.group(1)); continue
+        m = re.match(r"connected time:\s*(\d+) seconds", s)
+        if m: link.connected_secs = int(m.group(1)); continue
+    return link
+
+
+def parse_iface_info(text: str) -> Dict[str, str]:
+    info = {}
+    for raw in text.splitlines():
+        s = raw.strip()
+        m = re.match(r"channel (\d+) \((\d+) MHz\), width: (\d+) MHz", s)
+        if m:
+            info["channel"] = m.group(1)
+            info["freq"] = m.group(2)
+            info["width"] = m.group(3)
+        m = re.match(r"txpower ([\d.]+) dBm", s)
+        if m:
+            info["txpower"] = m.group(1)
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Higher-level interpretation
+# ---------------------------------------------------------------------------
+
+def adapter_generation(phy: PhyCaps) -> Tuple[str, str]:
+    has_6g = any(b.label == "6 GHz" for b in phy.bands.values())
+    has_eht = any(b.has_eht for b in phy.bands.values())
+    has_he = any(b.has_he for b in phy.bands.values())
+    has_vht = any(b.has_vht for b in phy.bands.values())
+    has_ht = any(b.has_ht for b in phy.bands.values())
+    if has_eht:
+        return "WiFi 7", "802.11be — Extremely High Throughput, 320 MHz, 4096-QAM, MLO."
+    if has_he and has_6g:
+        return "WiFi 6E", "802.11ax extended into 6 GHz — clean spectrum, wide channels."
+    if has_he:
+        return "WiFi 6", "802.11ax — OFDMA, MU-MIMO UL/DL, 1024-QAM, TWT."
+    if has_vht:
+        return "WiFi 5", "802.11ac — 5 GHz only, 80/160 MHz, 256-QAM."
+    if has_ht:
+        return "WiFi 4", "802.11n — first MIMO/HT generation."
+    return "Pre-WiFi 4", "Legacy 802.11a/b/g."
+
+
+def link_generation(link: LinkInfo) -> str:
+    p = link.rx_phy or link.tx_phy
+    if p == "EHT": return "WiFi 7"
+    if p == "HE":
+        return "WiFi 6E" if link.freq_mhz >= 5925 else "WiFi 6"
+    if p == "VHT": return "WiFi 5"
+    if p == "HT":  return "WiFi 4"
+    return "legacy 802.11a/b/g"
+
+
+def estimated_modulation(phy_kind: str, mcs: Optional[int]) -> str:
+    if mcs is None: return "?"
+    if phy_kind == "HE":
+        return {0: "BPSK 1/2", 1: "QPSK 1/2", 2: "QPSK 3/4", 3: "16-QAM 1/2",
+                4: "16-QAM 3/4", 5: "64-QAM 2/3", 6: "64-QAM 3/4", 7: "64-QAM 5/6",
+                8: "256-QAM 3/4", 9: "256-QAM 5/6", 10: "1024-QAM 3/4",
+                11: "1024-QAM 5/6"}.get(mcs, f"MCS {mcs}")
+    if phy_kind == "EHT":
+        return {12: "4096-QAM 3/4", 13: "4096-QAM 5/6"}.get(mcs, f"MCS {mcs}")
+    if phy_kind == "VHT":
+        return {0: "BPSK", 1: "QPSK 1/2", 2: "QPSK 3/4", 3: "16-QAM 1/2",
+                4: "16-QAM 3/4", 5: "64-QAM 2/3", 6: "64-QAM 3/4", 7: "64-QAM 5/6",
+                8: "256-QAM 3/4", 9: "256-QAM 5/6"}.get(mcs, f"MCS {mcs}")
+    if phy_kind == "HT":
+        return f"HT MCS {mcs}"
+    return "—"
+
+
+def signal_quality(dbm: int) -> Tuple[str, str]:
+    if dbm >= -50: return C.green("excellent"), "near AP, supports highest QAM"
+    if dbm >= -60: return C.green("very good"), "supports 256/1024-QAM comfortably"
+    if dbm >= -67: return C.yellow("good"),     "fine for streaming/calls"
+    if dbm >= -75: return C.yellow("fair"),     "modulation will drop, range edge"
+    if dbm >= -85: return C.red("weak"),        "low throughput, retries likely"
+    return C.red("unusable"), "association may drop"
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def report_adapter(phy: PhyCaps, chipset: Dict[str, str]):
+    gen, gen_blurb = adapter_generation(phy)
+    header(f"Adapter capabilities ({phy.name})")
+    if chipset:
+        marketing = chipset.get("marketing") or chipset.get("vendor_device") or "unknown"
+        chip_extra = []
+        if chipset.get("vendor_device") and chipset.get("vendor_device") != marketing:
+            chip_extra.append(chipset["vendor_device"])
+        if chipset.get("driver"):
+            chip_extra.append(f"driver: {chipset['driver']}")
+        if chipset.get("bus") and chipset.get("slot"):
+            chip_extra.append(f"{chipset['bus']} {chipset['slot']}")
+        kv("Chipset", C.bold(marketing),
+           " · ".join(chip_extra) if chip_extra else "")
+    kv("Highest standard", C.bold(C.green(gen)), gen_blurb)
+
+    bands = list(phy.bands.values())
+    band_str = ", ".join(f"{b.label} ({b.enabled_channels} ch)" for b in bands)
+    kv("Bands supported", band_str)
+
+    max_nss = max((b.max_nss for b in bands), default=0)
+    if phy.tx_antennas and phy.rx_antennas:
+        kv("MIMO config", f"{phy.tx_antennas}×{phy.rx_antennas} antennas, "
+                          f"up to {max_nss} spatial stream(s)",
+           "more streams ≈ proportionally more throughput")
+
+    max_w = max((max(b.widths, default=0) for b in bands), default=0)
+    kv("Max channel width", f"{max_w} MHz" if max_w else "?",
+       "wider = faster, but needs proximity & free spectrum")
+
+    if any(b.qam_4096_tx for b in bands):
+        kv("Max modulation", "4096-QAM (12 bits/symbol)", "WiFi 7")
+    elif any(b.qam_1024_tx for b in bands):
+        kv("Max modulation", "1024-QAM (10 bits/symbol)", "WiFi 6")
+    elif any(b.has_vht for b in bands):
+        kv("Max modulation", "256-QAM (8 bits/symbol)", "WiFi 5")
+    elif any(b.has_ht for b in bands):
+        kv("Max modulation", "64-QAM")
+
+    print()
+    print(C.bold("  Per-band detail:"))
+    for b in bands:
+        flags = []
+        if b.has_eht: flags.append("EHT")
+        if b.has_he:  flags.append("HE")
+        if b.has_vht: flags.append("VHT")
+        if b.has_ht:  flags.append("HT")
+        print(f"    • {C.cyan(b.label):<22} widths {sorted(b.widths)} MHz, "
+              f"NSS≤{b.max_nss}, {'/'.join(flags) or '-'}")
+
+    # Feature roll-up across bands
+    print()
+    print(C.bold("  Notable features supported:"))
+    feats = set()
+    for b in bands:
+        if b.su_beamformee: feats.add("SU Beamformee")
+        if b.mu_beamformee: feats.add("MU Beamformee")
+        if b.mu_mimo_ul:    feats.add("MU-MIMO")
+        if b.twt:           feats.add("TWT")
+        if b.bss_color:     feats.add("BSS Color")
+        if b.ldpc:          feats.add("LDPC")
+        if b.stbc_rx or b.stbc_tx: feats.add("STBC")
+        if 160 in b.widths: feats.add("160 MHz")
+        if 320 in b.widths: feats.add("320 MHz")
+        if b.qam_1024_tx:   feats.add("1024-QAM")
+        if b.qam_4096_tx:   feats.add("4096-QAM")
+    if any(b.label == "6 GHz" for b in bands):
+        feats.add("6 GHz")
+    if phy.rrm:           feats.add("11k")
+    if phy.protected_twt: feats.add("TWT")
+    if phy.sae:           feats.add("WPA3")
+
+    # Print explanation for each feature
+    for name in sorted(feats):
+        bullet("✓", name, FEATURES.get(name, ""))
+
+
+def report_link(link: LinkInfo, iface_info: Dict[str, str]):
+    header(f"Active link ({link.iface})")
+    if not link.connected:
+        print("  " + C.yellow("not associated to any network"))
+        return
+
+    gen = link_generation(link)
+    band = "2.4 GHz" if link.freq_mhz < 3000 else (
+           "6 GHz"   if link.freq_mhz >= 5925 else "5 GHz")
+    kv("SSID / BSSID", f"{C.bold(link.ssid)}  ({link.bssid})")
+    chan = iface_info.get("channel", "?")
+    width = iface_info.get("width", str(link.rx_width or link.tx_width or "?"))
+    kv("Channel", f"{chan} on {band}  ({link.freq_mhz:.0f} MHz, {width} MHz wide)")
+    kv("Generation in use", C.bold(C.green(gen)),
+       f"{link.rx_phy} PHY frames")
+
+    if link.signal_dbm is not None:
+        q, q_expl = signal_quality(link.signal_dbm)
+        kv("Signal", f"{link.signal_dbm} dBm  ({q})", q_expl)
+
+    rx_mod = estimated_modulation(link.rx_phy, link.rx_mcs)
+    tx_mod = estimated_modulation(link.tx_phy, link.tx_mcs)
+    kv("RX rate", f"{link.rx_bitrate:>7.1f} Mbps   "
+       f"MCS {link.rx_mcs} / NSS {link.rx_nss} / GI {link.rx_gi}", rx_mod)
+    kv("TX rate", f"{link.tx_bitrate:>7.1f} Mbps   "
+       f"MCS {link.tx_mcs} / NSS {link.tx_nss} / GI {link.tx_gi}", tx_mod)
+
+    # rough application-layer estimate (~65% of PHY)
+    kv("Est. throughput", f"~{int(min(link.rx_bitrate, link.tx_bitrate) * 0.65)} Mbps "
+                          "useful payload", "WiFi MAC overhead ≈ 30–40 %")
+
+    if link.connected_secs is not None:
+        kv("Associated for", f"{link.connected_secs} s")
+    if link.tx_retries is not None:
+        rate_pct = (link.tx_failed / link.tx_retries * 100) if link.tx_retries else 0.0
+        kv("TX retries / failed",
+           f"{link.tx_retries} / {link.tx_failed}",
+           f"failure rate ~{rate_pct:.1f} % of retries — "
+           f"{'OK' if (link.tx_failed or 0) < 50 else 'investigate'}")
+
+
+def report_discrepancies(phy: PhyCaps, link: LinkInfo):
+    header("Used vs supported — what you're leaving on the table")
+    if not link.connected:
+        print("  (no active link)")
+        return
+
+    notes = []
+
+    # generation
+    sup_gen, _ = adapter_generation(phy)
+    use_gen = link_generation(link)
+    if sup_gen != use_gen:
+        notes.append((C.yellow,
+            f"Adapter is {sup_gen} but the link is operating as {use_gen}.",
+            f"the AP either doesn't advertise {sup_gen} or you're on a band that "
+            f"doesn't support it."))
+
+    # band — 6 GHz available but unused
+    if any(b.label == "6 GHz" for b in phy.bands.values()) and link.freq_mhz < 5925:
+        notes.append((C.yellow,
+            "Adapter supports the 6 GHz band (WiFi 6E) but you are connected on "
+            f"{('5' if link.freq_mhz>=3000 else '2.4')} GHz.",
+            "if your AP has a 6 GHz radio, switching to it gives clean spectrum "
+            "and wider channels."))
+
+    # width
+    band_idx = None
+    for bid, b in phy.bands.items():
+        if b.freqs_mhz and b.freqs_mhz[0][0] <= link.freq_mhz <= b.freqs_mhz[-1][0]:
+            band_idx = bid
+    if band_idx is not None:
+        b = phy.bands[band_idx]
+        max_w = max(b.widths, default=0)
+        cur_w = link.rx_width or link.tx_width or 0
+        if max_w and cur_w and cur_w < max_w:
+            notes.append((C.yellow,
+                f"Channel is {cur_w} MHz wide but adapter+band can do {max_w} MHz.",
+                "AP likely advertises a narrower primary channel, or wider bonding "
+                "is unavailable here (DFS / neighbour interference)."))
+
+    # NSS
+    max_nss = max((b.max_nss for b in phy.bands.values()), default=0)
+    used_nss = max(link.rx_nss or 0, link.tx_nss or 0)
+    if max_nss and used_nss and used_nss < max_nss:
+        notes.append((C.yellow,
+            f"Only {used_nss} spatial stream(s) negotiated, adapter supports "
+            f"{max_nss}.",
+            "AP has fewer antennas than the adapter, or signal is too weak to "
+            "sustain another stream."))
+
+    # MCS / modulation ceiling
+    max_mcs_he = max((b.max_he_mcs for b in phy.bands.values()), default=-1)
+    used_mcs = link.rx_mcs if link.rx_mcs is not None else -1
+    if link.rx_phy == "HE" and max_mcs_he >= 11 and used_mcs < 11:
+        notes.append((C.yellow,
+            f"RX modulation is MCS {used_mcs} ({estimated_modulation('HE', used_mcs)}) "
+            f"while adapter can do MCS 11 (1024-QAM 5/6).",
+            "needs stronger signal / less interference to climb."))
+    if link.tx_mcs is not None and link.tx_mcs < (link.rx_mcs or 0):
+        notes.append((C.dim,
+            f"TX MCS ({link.tx_mcs}) is below RX MCS ({link.rx_mcs}).",
+            "asymmetric link — typical when the AP transmits more cleanly than the "
+            "client; the rate-control algorithm errs on the safe side."))
+
+    # GI
+    if link.rx_gi == 2:
+        notes.append((C.dim,
+            "Long Guard Interval (3.2 µs) in use.",
+            "OFDMA / multipath robustness is preferred over peak speed; expected on "
+            "WiFi 6 in many APs."))
+
+    # signal-driven note
+    if link.signal_dbm is not None and link.signal_dbm < -65:
+        notes.append((C.yellow,
+            "Signal is below −65 dBm.",
+            "rate adaptation will already have backed off from peak modulation; "
+            "moving closer or removing obstructions yields the biggest gain."))
+
+    if not notes:
+        print("  " + C.green("nothing obvious — link is using the adapter close to its peak."))
+        return
+
+    for color, title, expl in notes:
+        bullet(color("⚑"), title, expl)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Summarize Wi-Fi adapter capabilities and the active link.",
+        epilog="Reads from `iw`. Inspired by https://www.wiisfi.com/")
+    ap.add_argument("-i", "--interface", help="wifi interface (auto-detected if omitted)")
+    ap.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    args = ap.parse_args()
+
+    if args.no_color:
+        C.enabled = False
+    if shutil.which("iw") is None:
+        sys.exit("error: `iw` not found in PATH. Install iproute2/iw first.")
+
+    iface, phy_name = discover_interface(args.interface)
+
+    phy_text   = run(["iw", phy_name, "info"])
+    link_text  = run(["iw", "dev", iface, "link"])
+    info_text  = run(["iw", "dev", iface, "info"])
+    stat_text  = run(["iw", "dev", iface, "station", "dump"])
+
+    phy = parse_phy(phy_text)
+    if not phy.name:
+        phy.name = phy_name
+    link = parse_link(link_text)
+    link.iface = iface
+    if link.connected:
+        link = parse_station(stat_text, link)
+    iface_info = parse_iface_info(info_text)
+    chipset = detect_chipset(iface)
+
+    print(C.bold(C.magenta("\n  wiisfi — local Wi-Fi capability & link summary")))
+    print(C.dim(f"  iface={iface}  phy={phy.name}"))
+
+    report_adapter(phy, chipset)
+    report_link(link, iface_info)
+    report_discrepancies(phy, link)
+    print()
+
+
+if __name__ == "__main__":
+    main()
